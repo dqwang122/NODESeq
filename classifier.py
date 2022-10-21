@@ -71,7 +71,8 @@ class ODEEncoder(nn.Module):
         super(ODEEncoder, self).__init__()
         self.embed = nn.Embedding(vocab_size, embed_dim)
         self.enc_proj = nn.Linear(embed_dim, nhidden)
-        self.ode = NeuralODE(ODEfunc(embed_dim, nhidden), solver=args.solver, rtol=args.rtol, atol=args.atol)
+        # self.ode = NeuralODE(ODEfunc(embed_dim, nhidden), solver=args.solver, rtol=args.rtol, atol=args.atol)
+        self.ode = NeuralODE(ODEfunc(embed_dim, nhidden), solver=args.solver, rtol=args.rtol, atol=args.atol, atol_adjoint=args.atol, rtol_adjoint=args.rtol)
 
     def forward(self, x):
         enc_input = self.embed(x)
@@ -233,12 +234,13 @@ if __name__ == '__main__':
         trainer.fit(learn, train_dataloaders=train_dataloader, val_dataloaders=test_dataloader)
 
     except KeyboardInterrupt:
-        if args.train_dir is not None:
-            ckpt_path = os.path.join(args.train_dir, 'ckpt.pth')
-            trainer.save_checkpoint(ckpt_path)
-            logger.info('Stored ckpt at {}'.format(ckpt_path))
+        version_path = os.path.join(args.train_dir, 'version_{}'.format(exper_logger.version))
+        ckpt_path = os.path.join(version_path, 'ckpt.pth')
+        trainer.save_checkpoint(ckpt_path)
+        logger.info('Stored ckpt at {}'.format(ckpt_path))
     
-    ckpt_path = os.path.join(args.train_dir, 'last.ckpt')
+    version_path = os.path.join(args.train_dir, 'version_{}'.format(exper_logger.version))
+    ckpt_path = os.path.join(version_path, 'ckpt.pth')
     trainer.save_checkpoint(ckpt_path)
     logger.info('Stored ckpt at {}'.format(ckpt_path))
 

@@ -34,7 +34,7 @@ npr.seed(233)
 torch.random.manual_seed(233)
 
 parser = argparse.ArgumentParser()
-parser.add_argument('--model', type=str, default='lr')
+parser.add_argument('--model', type=str, default='vae')
 parser.add_argument('--adjoint', type=eval, default=True)
 parser.add_argument('--max_epoch', type=int, default=20)
 parser.add_argument('--max_len', type=int, default=200)
@@ -42,6 +42,7 @@ parser.add_argument('--lr', type=float, default=0.001)
 parser.add_argument('--bz', type=int, default=32)
 parser.add_argument('--rtol', type=float, default=1e-2)
 parser.add_argument('--atol', type=float, default=1e-2)
+parser.add_argument('--solver', type=str, default='dopri5')
 parser.add_argument('--gpu', type=int, default=0)
 parser.add_argument('--train_dir', type=str, default='trainlog/test')
 parser.add_argument('--vis', action='store_true')
@@ -53,13 +54,14 @@ args = parser.parse_args()
 
 ############# module for cls ode #############
 
-class ODEfunc(nn.Module):
+class LatentODEfunc(nn.Module):
 
-    def __init__(self, embed_size, nhidden):
-        super(ODEfunc, self).__init__()
+    def __init__(self, latent_dim=4, nhidden=20):
+        super(LatentODEfunc, self).__init__()
         self.elu = nn.ELU(inplace=True)
-        self.fc1 = nn.Linear(nhidden, nhidden)
+        self.fc1 = nn.Linear(latent_dim, nhidden)
         self.fc2 = nn.Linear(nhidden, nhidden)
+        self.fc3 = nn.Linear(nhidden, latent_dim)
         self.nfe = 0
 
     def forward(self, t, x):
@@ -67,22 +69,9 @@ class ODEfunc(nn.Module):
         out = self.fc1(x)
         out = self.elu(out)
         out = self.fc2(out)
+        out = self.elu(out)
+        out = self.fc3(out)
         return out
-
-class ODEEncoder(nn.Module):
-
-    def __init__(self, vocab_size, embed_dim=10, nhidden=25):
-        super(ODEEncoder, self).__init__()
-        self.embed = nn.Embedding(vocab_size, embed_dim)
-        self.enc_proj = nn.Linear(embed_dim, nhidden)
-        self.ode = NeuralODE(ODEfunc(embed_dim, nhidden), solver='dopri5', rtol=args.rtol, atol=args.atol)
-
-    def forward(self, x):
-        enc_input = self.embed(x)
-        ode_input = self.enc_proj(enc_input)
-        t_span = torch.Tensor([0, 1]).type_as(ode_input)
-        eval_times, enc_output = self.ode(ode_input, t_span)
-        return enc_output[-1]
 
 class Encoder(nn.Module):
 
@@ -96,7 +85,6 @@ class Encoder(nn.Module):
         enc_out, enc_hidden_state = self.lstm(enc_input)  # (bz, L, 2 * dim)
         return enc_out, enc_hidden_state
 
-
 class Decoder(nn.Module):
     def __init__(self, embed, embed_dim, latent_dim, nhidden, num_layers=1):
         super().__init__()
@@ -106,7 +94,6 @@ class Decoder(nn.Module):
 
     def forward(self, trg, z):
         dec_input = self.embed(trg)
-        z = z.unsqueeze(1).expand((dec_input.size(0), dec_input.size(1), z.size(-1)))
         dec_enhance_input = torch.cat([dec_input, z], dim=-1)
         dec_enhance_input = self.dec_input_proj(dec_enhance_input)
         dec_out, dec_hidden_state = self.lstm(dec_enhance_input)
@@ -126,6 +113,7 @@ class VAEModel(nn.Module):
         self.init_model()
         
     def forward(self, src, trg):
+        bz, L = src.size()
         enc_out, enc_hidden_state = self.enc(src)       # (bz, L, 2 * dim)
         enc_repr = enc_out[:,-1,:]          # (bz, 2 * dim)
         mu, logvar = self.mu_proj(enc_repr), self.logvar_proj(enc_repr)     # (bz, latent)
@@ -133,6 +121,7 @@ class VAEModel(nn.Module):
 
         # z = odeint(self.ode, z, range(l)).permute(1, 0, 2)        # [batch_size, dec_hidden_size]
 
+        z = z.unsqueeze(1).expand((bz, L-1, z.size(-1)))
         dec_output = self.dec(trg[:, :-1], z)    
         score = self.out_proj(dec_output)           
 
@@ -156,6 +145,30 @@ class VAEModel(nn.Module):
         if self.w2v.all() != None:
             self.embed.weight.data = torch.Tensor(self.w2v).type_as(self.embed.weight.data)
             # self.enc.embed.requires_grad_(False)
+
+
+class VAEODE(VAEModel):
+    def __init__(self, vocab_size, embed_dim, hidden_dim, latent_dim, nlayer=2, w2v=None):
+        super().__init__(vocab_size, embed_dim, hidden_dim, latent_dim, nlayer, w2v)
+        self.ode = NeuralODE(LatentODEfunc(latent_dim, latent_dim * 2),solver=args.solver, rtol=args.rtol, atol=args.atol, atol_adjoint=args.atol, rtol_adjoint=args.rtol)
+
+    def forward(self, src, trg):
+        bz, L = src.size()
+        enc_out, enc_hidden_state = self.enc(src)       # (bz, L, 2 * dim)
+        enc_repr = enc_out[:,0,:]          # (bz, 2 * dim)
+        mu, logvar = self.mu_proj(enc_repr), self.logvar_proj(enc_repr)     # (bz, latent_dim)
+        z0 = self.reparameterize(mu, logvar) 
+
+        t_span = torch.arange(L-1).type_as(z0)
+        eval_times, z_span = self.ode(z0, t_span)               # enc_output: (L, bz, latent_dim)
+        z_span = z_span.permute(1,0,2)
+        dec_output = self.dec(trg[:, :-1], z_span)              
+        score = self.out_proj(dec_output)           
+
+        return score, (mu, logvar)
+    
+
+
 
 class Learner(pl.LightningModule):
     def __init__(self, model:nn.Module, lr=1e-3, kl_coef=0.1, custom_log = None):
@@ -273,7 +286,10 @@ if __name__ == '__main__':
 
     # model
     glove = load_w2v(vocab.get_vocab_dict(), embed_dim)
-    model = VAEModel(len(vocab), embed_dim, hidden_dim=hidden_size, latent_dim=latent_dim, w2v=glove).to(device)
+    if args.model == "ode":
+        model = VAEODE(len(vocab), embed_dim, hidden_dim=hidden_size, latent_dim=latent_dim, w2v=glove).to(device)
+    else:
+        model = VAEModel(len(vocab), embed_dim, hidden_dim=hidden_size, latent_dim=latent_dim, w2v=glove).to(device)
     model_number = sum(p.numel() for p in model.parameters() if p.requires_grad)
     logger.info(model)
     logger.info(model_number)
@@ -290,11 +306,12 @@ if __name__ == '__main__':
         trainer.fit(learn, train_dataloaders=train_dataloader, val_dataloaders=test_dataloader)
 
     except KeyboardInterrupt:
-        if args.train_dir is not None:
-            ckpt_path = os.path.join(args.train_dir, 'ckpt.pth')
-            trainer.save_checkpoint(ckpt_path)
-            logger.info('Stored ckpt at {}'.format(ckpt_path))
+        version_path = os.path.join(args.train_dir, 'version_{}'.format(exper_logger.version))
+        ckpt_path = os.path.join(version_path, 'ckpt.pth')
+        trainer.save_checkpoint(ckpt_path)
+        logger.info('Stored ckpt at {}'.format(ckpt_path))
     
-    ckpt_path = os.path.join(args.train_dir, 'last.ckpt')
+    version_path = os.path.join(args.train_dir, 'version_{}'.format(exper_logger.version))
+    ckpt_path = os.path.join(version_path, 'ckpt.pth')
     trainer.save_checkpoint(ckpt_path)
     logger.info('Stored ckpt at {}'.format(ckpt_path))
